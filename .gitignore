@@ -1,0 +1,9 @@
+# Secrets et configuration propre à chaque machine
+.env
+.external-libraries
+docker-compose.override.yml
+
+# Données : photos, base, sauvegardes
+library/
+postgres/
+backups/

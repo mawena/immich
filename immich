@@ -1,0 +1,861 @@
+#!/usr/bin/env bash
+#
+# Immich — pilote de la pile de conteneurs Immich.
+#
+#   ./immich install     première mise en route, de zéro au service en ligne
+#   ./immich start       démarre la pile
+#   ./immich stop        arrête la pile sans rien détruire
+#   ./immich remove      supprime les conteneurs (et, sur demande, les données)
+#
+# `./immich help` liste toutes les commandes.
+#
+# Aucune valeur n'est codée en dur hors des défauts d'Immich : tout est lu dans
+# .env et dans docker-compose.yml.
+
+set -euo pipefail
+
+cd "$(dirname "$(readlink -f "$0")")"
+
+COMPOSE=(docker compose)
+SERVER_SERVICE=immich-server
+DB_SERVICE=database
+HTTP_PORT=2283
+BACKUP_DIR=./backups
+# Image jetable pour manipuler les dossiers de données : ils appartiennent aux
+# utilisateurs des conteneurs (root, postgres), pas à l'utilisateur courant.
+HELPER_IMAGE=alpine:3
+
+COMPOSE_URL=https://github.com/immich-app/immich/releases/latest/download/docker-compose.yml
+ENV_URL=https://github.com/immich-app/immich/releases/latest/download/example.env
+RELEASES_API=https://api.github.com/repos/immich-app/immich/releases
+RELEASE_FILES_URL=https://github.com/immich-app/immich/releases/download   # /<tag>/<fichier>
+
+# ------------------------------------------------------------------ affichage
+
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+    C_TITLE=$'\033[1;36m'; C_OK=$'\033[32m'; C_WARN=$'\033[33m'
+    C_ERR=$'\033[31m';     C_END=$'\033[0m'
+else
+    C_TITLE=''; C_OK=''; C_WARN=''; C_ERR=''; C_END=''
+fi
+
+title() { printf '\n%s==> %s%s\n' "$C_TITLE" "$*" "$C_END"; }
+info()  { printf '    %s\n' "$*"; }
+ok()    { printf '    %s✓%s %s\n' "$C_OK" "$C_END" "$*"; }
+warn()  { printf '    %s!%s %s\n' "$C_WARN" "$C_END" "$*" >&2; }
+die()   { printf '\n%serreur :%s %s\n' "$C_ERR" "$C_END" "$*" >&2; exit 1; }
+
+confirm() { # confirm <question> <mot-attendu>
+    local answer
+    [ -t 0 ] || die "Confirmation impossible hors terminal. Relance depuis un shell interactif."
+    printf '\n%s\n    Tape « %s » pour confirmer : ' "$1" "$2"
+    read -r answer
+    [ "$answer" = "$2" ] || die "Annulé."
+}
+
+# ----------------------------------------------------------------- lecture env
+#
+# Lecture ciblée : sourcer .env exposerait les $(...) et les guillemets à une
+# interprétation du shell.
+
+env_get() { # env_get <CLE> [valeur par défaut]
+    local value=''
+    [ -f .env ] && value=$(sed -n "s/^$1=//p" .env | head -n 1 | tr -d '"' | tr -d "'")
+    printf '%s' "${value:-${2:-}}"
+}
+
+env_set() { # env_set <CLE> <valeur> — remplace la ligne, ou la décommente, ou l'ajoute
+    if grep -q "^$1=" .env; then
+        sed -i "s|^$1=.*|$1=$2|" .env
+    elif grep -q "^# *$1=" .env; then
+        sed -i "s|^# *$1=.*|$1=$2|" .env
+    else
+        printf '%s=%s\n' "$1" "$2" >> .env
+    fi
+}
+
+load_env() {
+    UPLOAD_LOCATION=$(env_get UPLOAD_LOCATION ./library)
+    DB_DATA_LOCATION=$(env_get DB_DATA_LOCATION ./postgres)
+    DB_USERNAME=$(env_get DB_USERNAME postgres)
+    DB_DATABASE_NAME=$(env_get DB_DATABASE_NAME immich)
+    IMMICH_VERSION=$(env_get IMMICH_VERSION release)
+}
+
+# ------------------------------------------------------------- vérifications
+
+check_docker() {
+    command -v docker >/dev/null 2>&1 \
+        || die "Docker est absent de cette machine. https://docs.docker.com/engine/install/"
+    docker compose version >/dev/null 2>&1 \
+        || die "Le plugin « docker compose » est absent (docker-compose v1 ne suffit pas)."
+    docker info >/dev/null 2>&1 \
+        || die "Le démon Docker ne répond pas. Démarre-le, ou ajoute ton utilisateur au groupe docker."
+}
+
+check_files() {
+    [ -f docker-compose.yml ] || die "docker-compose.yml absent. Lance « ./immich install »."
+    [ -f .env ] || die "Aucun fichier .env. Lance « ./immich install »."
+}
+
+stack_running() {
+    [ -n "$("${COMPOSE[@]}" ps -q 2>/dev/null)" ]
+}
+
+service_running() { # service_running <service>
+    [ -n "$("${COMPOSE[@]}" ps -q --status running "$1" 2>/dev/null)" ]
+}
+
+check_port_free() {
+    command -v ss >/dev/null 2>&1 || { info "ss absent : vérification du port ignorée." ; return 0 ; }
+    if ss -H -ltn "sport = :$HTTP_PORT" 2>/dev/null | grep -q .; then
+        stack_running && return 0
+        warn "Le port $HTTP_PORT est déjà écouté par un autre processus :"
+        info "  $(ss -H -ltnp "sport = :$HTTP_PORT" 2>/dev/null | head -n 1 || true)"
+        info "  Change « '$HTTP_PORT:2283' » dans docker-compose.yml."
+        return 1
+    fi
+    ok "Port $HTTP_PORT disponible."
+}
+
+server_url() {
+    printf 'http://localhost:%s' "$HTTP_PORT"
+}
+
+ping_server() {
+    curl -fsS --max-time 3 "$(server_url)/api/server/ping" 2>/dev/null | grep -q pong
+}
+
+wait_server() {
+    local tries=90
+    command -v curl >/dev/null 2>&1 || { info "curl absent : attente du serveur ignorée." ; return 0 ; }
+    info "Attente du serveur Immich (les migrations peuvent prendre un moment)..."
+    while [ "$tries" -gt 0 ]; do
+        if ping_server; then
+            ok "Le serveur répond sur $(server_url)."
+            return 0
+        fi
+        tries=$((tries - 1))
+        sleep 2
+    done
+    die "Le serveur ne répond pas. Regarde « ./immich logs $SERVER_SERVICE »."
+}
+
+wait_db() {
+    local tries=60
+    while [ "$tries" -gt 0 ]; do
+        if "${COMPOSE[@]}" exec -T "$DB_SERVICE" pg_isready -U "$DB_USERNAME" >/dev/null 2>&1; then
+            ok "Postgres est prêt."
+            return 0
+        fi
+        tries=$((tries - 1))
+        sleep 2
+    done
+    die "Postgres ne répond pas. Regarde « ./immich logs $DB_SERVICE »."
+}
+
+# Les dossiers de données appartiennent aux conteneurs : un rm -rf lancé par
+# l'utilisateur échouerait. On passe par un conteneur jetable.
+wipe_dir() { # wipe_dir <dossier>
+    local dir
+    dir=$(readlink -f "$1")
+    [ -d "$dir" ] || return 0
+    case "$dir" in
+        /|/home|/home/*/|/var|/etc|/usr) die "Refus d'effacer $dir." ;;
+    esac
+    docker run --rm -v "$dir:/target" "$HELPER_IMAGE" \
+        sh -c 'find /target -mindepth 1 -delete'
+    rmdir "$dir" 2>/dev/null || true
+}
+
+dir_size() { # dir_size <dossier>
+    local dir
+    dir=$(readlink -f "$1")
+    [ -d "$dir" ] || { printf 'absent'; return 0; }
+    docker run --rm -v "$dir:/target:ro" "$HELPER_IMAGE" du -sh /target 2>/dev/null | cut -f1
+}
+
+# -------------------------------------------------------------- installation
+
+fetch() { # fetch <url> <fichier>
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL "$1" -o "$2"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -qO "$2" "$1"
+    else
+        die "Ni curl ni wget : impossible de télécharger $1"
+    fi
+}
+
+create_compose() {
+    if [ -f docker-compose.yml ]; then
+        ok "docker-compose.yml déjà présent, laissé intact."
+        return 0
+    fi
+    fetch "$COMPOSE_URL" docker-compose.yml
+    ok "docker-compose.yml téléchargé depuis la dernière release."
+}
+
+create_env() {
+    if [ -f .env ]; then
+        ok ".env déjà présent, laissé intact."
+        return 0
+    fi
+    fetch "$ENV_URL" .env
+    ok ".env téléchargé depuis la dernière release."
+
+    # Immich n'accepte que [A-Za-z0-9] pour ce mot de passe.
+    local secret
+    secret=$(LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c 32)
+    env_set DB_PASSWORD "$secret"
+    ok "DB_PASSWORD remplacé par une valeur aléatoire."
+
+    if [ -f /etc/timezone ]; then
+        env_set TZ "$(cat /etc/timezone)"
+        ok "Fuseau horaire : $(cat /etc/timezone)"
+    fi
+}
+
+cmd_install() {
+    title "Vérification des prérequis"
+    check_docker
+    ok "Docker et le plugin compose répondent."
+
+    create_compose
+    create_env
+    load_env
+
+    if ! check_port_free && [ -t 0 ]; then
+        confirm "Continuer malgré tout ?" "yes"
+    fi
+
+    title "Dossiers de données"
+    mkdir -p "$UPLOAD_LOCATION" "$DB_DATA_LOCATION"
+    ok "Médias : $UPLOAD_LOCATION   ·   Base : $DB_DATA_LOCATION"
+
+    title "Téléchargement des images (version $IMMICH_VERSION)"
+    "${COMPOSE[@]}" pull
+    ok "Images à jour."
+
+    title "Démarrage de la pile"
+    "${COMPOSE[@]}" up -d
+    wait_server
+
+    summary
+    info "Premier passage : ouvre l'URL et crée le compte administrateur."
+}
+
+summary() {
+    title "Immich est en marche"
+    info "Interface : $(server_url)"
+    local ip
+    ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+    [ -n "$ip" ] && info "Réseau    : http://$ip:$HTTP_PORT"
+    printf '\n'
+    info "État : ./immich status   ·   Journaux : ./immich logs   ·   Arrêt : ./immich stop"
+}
+
+# ------------------------------------------------------------------ commandes
+
+cmd_start() {
+    check_files
+    check_docker
+    title "Démarrage de la pile"
+    "${COMPOSE[@]}" up -d
+    wait_server
+    summary
+}
+
+cmd_stop() {
+    check_docker
+    title "Arrêt de la pile"
+    "${COMPOSE[@]}" stop
+    ok "Conteneurs arrêtés. Les données et les conteneurs sont conservés."
+    info "Relance : ./immich start"
+}
+
+cmd_restart() {
+    check_docker
+    title "Redémarrage ${*:-de toute la pile}"
+    "${COMPOSE[@]}" restart "$@"
+    ok "Redémarré."
+}
+
+cmd_remove() {
+    check_docker
+    load_env
+
+    local data=0 images=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --data|--volumes) data=1 ;;
+            --images)         images=1 ;;
+            --all)            data=1; images=1 ;;
+            *) die "Option inconnue pour « remove » : $1" ;;
+        esac
+        shift
+    done
+
+    if [ "$data" -eq 1 ]; then
+        confirm "Cela détruit DÉFINITIVEMENT toutes les photos et vidéos ($UPLOAD_LOCATION),
+la base Postgres ($DB_DATA_LOCATION) et le cache des modèles ML.
+Pense à « ./immich backup » et à copier $UPLOAD_LOCATION avant." "delete"
+    fi
+
+    title "Suppression des conteneurs"
+    if [ "$data" -eq 1 ]; then
+        "${COMPOSE[@]}" down --volumes --remove-orphans
+        wipe_dir "$DB_DATA_LOCATION"
+        wipe_dir "$UPLOAD_LOCATION"
+        ok "Conteneurs, réseau, cache ML, base et médias supprimés."
+    else
+        "${COMPOSE[@]}" down --remove-orphans
+        ok "Conteneurs et réseau supprimés. Médias et base sont conservés."
+        info "Pour tout effacer : ./immich remove --all"
+    fi
+
+    if [ "$images" -eq 1 ]; then
+        title "Suppression des images"
+        local image
+        for image in $("${COMPOSE[@]}" config --images 2>/dev/null); do
+            docker image rm "$image" >/dev/null 2>&1 && ok "$image supprimée" || info "$image absente"
+        done
+    fi
+
+    info "docker-compose.yml, .env et les sauvegardes ($BACKUP_DIR) ne sont jamais touchés."
+}
+
+cmd_status() {
+    check_docker
+    load_env
+    title "État des conteneurs"
+    "${COMPOSE[@]}" ps
+    title "Serveur"
+    if ping_server; then
+        ok "L'API répond sur $(server_url)."
+        local version
+        version=$("${COMPOSE[@]}" exec -T "$SERVER_SERVICE" immich-admin version 2>/dev/null | tail -n 1 || true)
+        [ -n "$version" ] && info "Version : $version (IMMICH_VERSION=$IMMICH_VERSION)"
+    else
+        warn "L'API ne répond pas sur $(server_url)."
+    fi
+}
+
+cmd_logs() {
+    check_docker
+    "${COMPOSE[@]}" logs -f --tail=100 "$@"
+}
+
+cmd_shell() {
+    check_docker
+    "${COMPOSE[@]}" exec "${1:-$SERVER_SERVICE}" bash
+}
+
+cmd_psql() {
+    check_docker
+    load_env
+    "${COMPOSE[@]}" exec "$DB_SERVICE" psql -U "$DB_USERNAME" -d "$DB_DATABASE_NAME" "$@"
+}
+
+cmd_admin() {
+    check_docker
+    service_running "$SERVER_SERVICE" || die "Le serveur est arrêté. Lance « ./immich start »."
+    "${COMPOSE[@]}" exec "$SERVER_SERVICE" immich-admin "$@"
+}
+
+# ------------------------------------------------------------- mise à jour
+#
+# Une release Immich, c'est des images ET un docker-compose.yml (digests de
+# Postgres et Valkey, nouveaux services...). `update` aligne les deux.
+
+latest_release() { # dernière release stable (les rc sont exclues par GitHub)
+    local tag
+    tag=$(curl -fsSL --max-time 10 "$RELEASES_API/latest" 2>/dev/null \
+        | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -n 1)
+    [ -n "$tag" ] || die "Impossible de joindre GitHub pour connaître la dernière version."
+    printf '%s' "$tag"
+}
+
+release_exists() { # release_exists <tag>
+    curl -fsSL --max-time 10 -o /dev/null "$RELEASES_API/tags/$1" 2>/dev/null
+}
+
+# Version réellement déployée, lue dans les labels de l'image du conteneur :
+# fonctionne même si le serveur est arrêté.
+running_version() {
+    local id
+    id=$("${COMPOSE[@]}" ps -aq "$SERVER_SERVICE" 2>/dev/null | head -n 1)
+    [ -n "$id" ] || return 0
+    docker inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}' "$id" 2>/dev/null || true
+}
+
+major_of() { # major_of v3.3.1 -> 3
+    local v=${1#v}
+    printf '%s' "${v%%.*}"
+}
+
+normalize_version() { # 3.3.1 -> v3.3.1 ; release reste release
+    case "$1" in
+        release|v*) printf '%s' "$1" ;;
+        *)          printf 'v%s' "$1" ;;
+    esac
+}
+
+# Choisit la version cible et la valeur d'IMMICH_VERSION à écrire.
+# Sans argument, reste dans la piste suivie par .env : on ne franchit jamais
+# une version majeure en silence.
+resolve_target() { # resolve_target [version] -> TARGET, NEW_PIN
+    local wanted=${1:-} latest
+    if [ -n "$wanted" ]; then
+        TARGET=$(normalize_version "$wanted")
+        [ "$TARGET" = release ] && TARGET=$(latest_release)
+        release_exists "$TARGET" || die "Version inconnue sur GitHub : $TARGET"
+        NEW_PIN=$(normalize_version "$wanted")
+        return 0
+    fi
+
+    latest=$(latest_release)
+    TARGET=$latest
+    case "$IMMICH_VERSION" in
+        release)
+            NEW_PIN=release ;;
+        v[0-9]*.*)   # épinglée sur une version précise : on déplace l'épingle
+            [ "$(major_of "$IMMICH_VERSION")" = "$(major_of "$latest")" ] \
+                || die "La dernière version ($latest) est une nouvelle version majeure.
+Lis les notes de version, puis lance explicitement : ./immich update $latest"
+            NEW_PIN=$latest ;;
+        v[0-9]*)     # piste majeure flottante (v3)
+            [ "$(major_of "$IMMICH_VERSION")" = "$(major_of "$latest")" ] \
+                || die "La dernière version ($latest) sort de la piste $IMMICH_VERSION.
+Lis les notes de version, puis lance explicitement : ./immich update $latest"
+            NEW_PIN=$IMMICH_VERSION ;;
+        *)
+            die "IMMICH_VERSION=$IMMICH_VERSION non reconnue. Précise la version : ./immich update v3.3.1" ;;
+    esac
+}
+
+fetch_release_compose() { # fetch_release_compose <tag> <fichier>
+    fetch "$RELEASE_FILES_URL/$1/docker-compose.yml" "$2" \
+        || die "docker-compose.yml introuvable pour la release $1."
+}
+
+update_check() {
+    check_files
+    check_docker
+    load_env
+
+    local current latest tmp
+    current=$(running_version)
+    latest=$(latest_release)
+
+    title "Versions"
+    info "Déployée      : ${current:-inconnue (conteneur absent)}"
+    info "Dernière      : $latest"
+    info "IMMICH_VERSION: $IMMICH_VERSION"
+
+    tmp=$(mktemp)
+    fetch_release_compose "$latest" "$tmp"
+    if cmp -s docker-compose.yml "$tmp"; then
+        ok "docker-compose.yml identique à celui de $latest."
+    else
+        warn "docker-compose.yml diffère de celui de $latest :"
+        diff -u docker-compose.yml "$tmp" | tail -n +3 | sed 's/^/      /' || true
+    fi
+    rm -f "$tmp"
+
+    if [ "$current" = "$latest" ]; then
+        ok "Immich est à jour."
+    else
+        info "Notes de version : https://github.com/immich-app/immich/releases/tag/$latest"
+        info "Mise à jour      : ./immich update"
+    fi
+}
+
+update_core() {
+    check_files
+    check_docker
+    load_env
+
+    local wanted='' yes=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -y|--yes) yes=1 ;;
+            -*)       die "Option inconnue pour « update » : $1" ;;
+            *)        [ -z "$wanted" ] || die "Une seule version à la fois."; wanted=$1 ;;
+        esac
+        shift
+    done
+
+    local current new_compose compose_changed=0 TARGET NEW_PIN
+    title "Recherche de la version cible"
+    resolve_target "$wanted"
+    current=$(running_version)
+    info "Déployée : ${current:-inconnue}"
+    info "Cible    : $TARGET   (IMMICH_VERSION=$NEW_PIN)"
+
+    new_compose=$(mktemp)
+    UPDATE_TMP=$new_compose
+    trap 'rm -f "$UPDATE_TMP"' EXIT
+    fetch_release_compose "$TARGET" "$new_compose"
+    cmp -s docker-compose.yml "$new_compose" || compose_changed=1
+
+    if [ "$current" = "$TARGET" ] && [ "$compose_changed" -eq 0 ] && [ "$NEW_PIN" = "$IMMICH_VERSION" ]; then
+        ok "Déjà à jour, rien à faire."
+        return 0
+    fi
+
+    if [ "$compose_changed" -eq 1 ]; then
+        title "Changements de docker-compose.yml"
+        diff -u docker-compose.yml "$new_compose" | tail -n +3 | sed 's/^/      /' || true
+        if diff docker-compose.yml "$new_compose" | grep -q '^[<>].*immich-app/postgres'; then
+            warn "L'image Postgres change : vérifie dans les notes de version qu'aucune"
+            warn "migration manuelle de la base n'est demandée."
+        fi
+    fi
+    if [ -n "$current" ] && [ "$(major_of "$current")" != "$(major_of "$TARGET")" ]; then
+        warn "Changement de version majeure ($current → $TARGET) : lis les notes de version."
+    fi
+    info "Notes de version : https://github.com/immich-app/immich/releases/tag/$TARGET"
+
+    if [ "$yes" -eq 0 ]; then
+        [ -t 0 ] || die "Lancé hors terminal : ajoute --yes pour confirmer la mise à jour."
+        confirm "Mettre à jour Immich de ${current:-?} vers $TARGET ?" "yes"
+    fi
+
+    if service_running "$DB_SERVICE"; then
+        title "Sauvegarde de la base avant mise à jour"
+        do_backup
+    else
+        warn "Postgres est arrêté : pas de sauvegarde de la base avant mise à jour."
+    fi
+
+    title "Application de la configuration $TARGET"
+    if [ "$compose_changed" -eq 1 ]; then
+        mkdir -p "$BACKUP_DIR"
+        local saved
+        saved="$BACKUP_DIR/docker-compose-${current:-unknown}-$(date +%Y%m%d-%H%M%S).yml"
+        cp docker-compose.yml "$saved"
+        cp "$new_compose" docker-compose.yml
+        ok "docker-compose.yml remplacé (ancien : $saved)."
+    fi
+    if [ "$NEW_PIN" != "$IMMICH_VERSION" ]; then
+        env_set IMMICH_VERSION "$NEW_PIN"
+        IMMICH_VERSION=$NEW_PIN
+        ok "IMMICH_VERSION=$NEW_PIN écrit dans .env."
+    fi
+    "${COMPOSE[@]}" config -q || die "docker-compose.yml invalide après mise à jour (ancien dans $BACKUP_DIR)."
+
+    title "Téléchargement des images ($IMMICH_VERSION)"
+    "${COMPOSE[@]}" pull
+    title "Recréation des conteneurs"
+    "${COMPOSE[@]}" up -d --remove-orphans
+    info "En cas d'échec : remets l'ancien docker-compose.yml et IMMICH_VERSION, puis « ./immich restore »."
+    wait_server
+    docker image prune -f >/dev/null && ok "Anciennes images nettoyées."
+
+    local now
+    now=$(running_version)
+    if [ "$now" = "$TARGET" ]; then
+        ok "Immich est en $now."
+    else
+        warn "Version déployée : ${now:-inconnue}, attendue : $TARGET."
+    fi
+    summary
+}
+
+cmd_update() {
+    case "${1:-}" in
+        check)  shift; update_check "$@" ;;
+        core)   shift; update_core "$@" ;;
+        *)      update_core "$@" ;;
+    esac
+}
+
+do_backup() {
+    mkdir -p "$BACKUP_DIR"
+    local file
+    file="$BACKUP_DIR/immich-db-$(date +%Y%m%d-%H%M%S).sql.gz"
+    "${COMPOSE[@]}" exec -T "$DB_SERVICE" \
+        pg_dumpall --clean --if-exists --username="$DB_USERNAME" | gzip > "$file" \
+        || { rm -f "$file"; die "Échec de la sauvegarde."; }
+    ok "Base sauvegardée : $file ($(du -h "$file" | cut -f1))"
+}
+
+cmd_backup() {
+    check_docker
+    load_env
+    service_running "$DB_SERVICE" || die "Postgres est arrêté. Lance « ./immich start »."
+    title "Sauvegarde de la base"
+    do_backup
+
+    local keep=${1:-}
+    if [ -n "$keep" ]; then
+        [[ "$keep" =~ ^[0-9]+$ ]] || die "Nombre de sauvegardes à garder invalide : $keep"
+        # shellcheck disable=SC2012
+        ls -1t "$BACKUP_DIR"/immich-db-*.sql.gz 2>/dev/null | tail -n +"$((keep + 1))" | while read -r old; do
+            rm -f "$old" && info "Supprimée : $old"
+        done
+    fi
+    info "La base ne contient pas les photos : copie aussi $UPLOAD_LOCATION."
+}
+
+# Procédure officielle : https://docs.immich.app/administration/backup-and-restore
+cmd_restore() {
+    check_files
+    check_docker
+    load_env
+
+    local file=${1:-}
+    if [ -z "$file" ]; then
+        # shellcheck disable=SC2012
+        file=$(ls -1t "$BACKUP_DIR"/immich-db-*.sql.gz 2>/dev/null | head -n 1 || true)
+        [ -n "$file" ] || die "Aucune sauvegarde dans $BACKUP_DIR. Usage : ./immich restore <fichier.sql.gz>"
+    fi
+    [ -f "$file" ] || die "Fichier introuvable : $file"
+
+    confirm "La base actuelle ($DB_DATA_LOCATION) sera effacée puis remplacée par :
+    $file
+Une sauvegarde de la base actuelle est faite juste avant, si Postgres tourne." "restore"
+
+    if service_running "$DB_SERVICE"; then
+        title "Sauvegarde de sécurité"
+        do_backup
+    fi
+
+    title "Arrêt et effacement de la base"
+    "${COMPOSE[@]}" down --remove-orphans
+    wipe_dir "$DB_DATA_LOCATION"
+    mkdir -p "$DB_DATA_LOCATION"
+    ok "Base effacée."
+
+    title "Restauration"
+    "${COMPOSE[@]}" create
+    "${COMPOSE[@]}" start "$DB_SERVICE"
+    wait_db
+    # Postgres s'initialise parfois en deux temps : on laisse la deuxième phase finir.
+    sleep 5
+    gunzip --stdout "$file" \
+        | sed "s/SELECT pg_catalog.set_config('search_path', '', false);/SELECT pg_catalog.set_config('search_path', 'public, pg_catalog', true);/g" \
+        | "${COMPOSE[@]}" exec -T "$DB_SERVICE" psql --quiet --dbname=postgres --username="$DB_USERNAME" >/dev/null
+    ok "Sauvegarde rejouée."
+
+    title "Démarrage de la pile"
+    "${COMPOSE[@]}" up -d
+    wait_server
+    summary
+}
+
+cmd_disk() {
+    check_docker
+    load_env
+    title "Espace disque"
+    info "Médias      ($UPLOAD_LOCATION) : $(dir_size "$UPLOAD_LOCATION")"
+    info "Base        ($DB_DATA_LOCATION) : $(dir_size "$DB_DATA_LOCATION")"
+    [ -d "$BACKUP_DIR" ] && info "Sauvegardes ($BACKUP_DIR) : $(du -sh "$BACKUP_DIR" | cut -f1)"
+    info "Libre sur la partition : $(df -h . | awk 'NR==2 {print $4}')"
+}
+
+# ------------------------------------------------------ bibliothèques externes
+#
+# Immich ne voit que les dossiers montés dans son conteneur. Les dossiers
+# déclarés ici sont montés au même chemin dans immich-server, via
+# docker-compose.override.yml (lu automatiquement par docker compose), ce qui
+# laisse intact le docker-compose.yml officiel.
+
+LIBRARIES_FILE=./.external-libraries   # une ligne par dossier : <chemin><TAB><ro|rw>
+OVERRIDE_FILE=./docker-compose.override.yml
+OVERRIDE_MARK='# Généré par ./immich library'
+
+write_override() {
+    if [ -f "$OVERRIDE_FILE" ] && ! grep -qF "$OVERRIDE_MARK" "$OVERRIDE_FILE"; then
+        die "$OVERRIDE_FILE existe et n'a pas été créé par ./immich : je n'y touche pas."
+    fi
+    if [ ! -s "$LIBRARIES_FILE" ]; then
+        rm -f "$OVERRIDE_FILE" "$LIBRARIES_FILE"
+        return 0
+    fi
+    {
+        printf '%s — ne pas modifier à la main, voir « ./immich library ».\n' "$OVERRIDE_MARK"
+        printf 'services:\n  %s:\n    volumes:\n' "$SERVER_SERVICE"
+        local path mode
+        while IFS=$'\t' read -r path mode; do
+            printf '      - type: bind\n'
+            printf '        source: "%s"\n' "$path"
+            printf '        target: "%s"\n' "$path"
+            [ "$mode" = rw ] || printf '        read_only: true\n'
+        done < "$LIBRARIES_FILE"
+    } > "$OVERRIDE_FILE"
+}
+
+apply_mounts() {
+    if stack_running; then
+        title "Recréation du serveur avec les nouveaux montages"
+        "${COMPOSE[@]}" up -d "$SERVER_SERVICE"
+        wait_server
+    else
+        info "La pile est arrêtée : les montages seront pris en compte au prochain « ./immich start »."
+    fi
+}
+
+library_add() {
+    local path='' mode=ro
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --rw) mode=rw ;;
+            -*)   die "Option inconnue pour « library add » : $1" ;;
+            *)    [ -z "$path" ] || die "Un seul chemin à la fois."; path=$1 ;;
+        esac
+        shift
+    done
+    [ -n "$path" ] || die "Usage : ./immich library add <dossier> [--rw]"
+    [ -d "$path" ] || die "Dossier introuvable : $path (le disque est-il monté ?)"
+    path=$(readlink -f "$path")
+    case "$path" in
+        *'"'*|*\\*|*$'\t'*|*$'\n'*) die "Chemin non pris en charge (guillemet, antislash ou tabulation) : $path" ;;
+    esac
+    if [ -f "$LIBRARIES_FILE" ] && cut -f1 "$LIBRARIES_FILE" | grep -qxF -- "$path"; then
+        die "Déjà déclaré : $path"
+    fi
+
+    title "Ajout d'une bibliothèque externe"
+    printf '%s\t%s\n' "$path" "$mode" >> "$LIBRARIES_FILE"
+    write_override
+    ok "$path monté dans $SERVER_SERVICE ($([ "$mode" = rw ] && echo lecture-écriture || echo lecture seule))."
+    apply_mounts
+
+    title "Dernière étape, dans l'interface web"
+    info "1. $(server_url) → Administration → Bibliothèques externes → Créer une bibliothèque"
+    info "2. Choisis le propriétaire, puis dans la bibliothèque : ⋮ → Modifier les chemins d'import → Ajouter"
+    info "3. Colle ce chemin, tel quel :"
+    info "     $path"
+    info "4. ⋮ → Scanner pour importer les fichiers."
+}
+
+library_remove() {
+    local path=${1:-}
+    [ -n "$path" ] || die "Usage : ./immich library remove <dossier>"
+    [ -d "$path" ] && path=$(readlink -f "$path")
+    { [ -f "$LIBRARIES_FILE" ] && cut -f1 "$LIBRARIES_FILE" | grep -qxF -- "$path"; } \
+        || die "Non déclaré : $path (voir « ./immich library list »)."
+
+    title "Retrait d'une bibliothèque externe"
+    local tmp
+    tmp=$(mktemp)
+    awk -F'\t' -v p="$path" '$1 != p' "$LIBRARIES_FILE" > "$tmp"
+    mv "$tmp" "$LIBRARIES_FILE"
+    write_override
+    ok "$path n'est plus monté."
+    apply_mounts
+    info "Supprime aussi la bibliothèque dans Administration → Bibliothèques externes,"
+    info "sinon Immich marquera ses fichiers comme hors ligne. Tes fichiers ne sont pas touchés."
+}
+
+library_list() {
+    title "Bibliothèques externes montées"
+    if [ ! -s "$LIBRARIES_FILE" ]; then
+        info "Aucune. Ajout : ./immich library add <dossier>"
+        return 0
+    fi
+    local path mode state
+    while IFS=$'\t' read -r path mode; do
+        [ -d "$path" ] && state='' || state="  ${C_WARN}(introuvable : disque débranché ?)${C_END}"
+        info "$path  [$mode]$state"
+    done < "$LIBRARIES_FILE"
+}
+
+cmd_library() {
+    check_files
+    check_docker
+    local sub=${1:-list}
+    [ $# -gt 0 ] && shift
+    case "$sub" in
+        add)       library_add "$@" ;;
+        remove|rm) library_remove "$@" ;;
+        list|ls)   library_list ;;
+        *) die "Sous-commande inconnue : $sub (add, remove, list)" ;;
+    esac
+}
+
+cmd_open() {
+    local url
+    url=$(server_url)
+    if command -v xdg-open >/dev/null 2>&1; then
+        xdg-open "$url" >/dev/null 2>&1 &
+        ok "Ouverture de $url"
+    else
+        info "$url"
+    fi
+}
+
+cmd_help() {
+    cat <<'HELP'
+Immich — pilote de la pile de conteneurs
+
+  Cycle de vie
+    ./immich install                installe tout : docker-compose.yml, .env (mot de passe
+                                    aléatoire), dossiers, images, démarrage
+    ./immich start                  démarre la pile
+    ./immich stop                   arrête les conteneurs sans rien détruire
+    ./immich restart [service]      redémarre toute la pile ou un service
+    ./immich update check           version déployée, dernière release, écart du compose
+    ./immich update [core] [version] [--yes]
+                                    met Immich à jour : sauvegarde la base, aligne
+                                    docker-compose.yml sur la release, tire les images,
+                                    recrée. Sans version : dernière release de la piste
+                                    IMMICH_VERSION (jamais de saut majeur implicite).
+                                    ex. ./immich update v3.3.1 fixe IMMICH_VERSION
+                                    --yes : sans confirmation (cron, ssh non interactif)
+    ./immich remove                 supprime conteneurs et réseau, garde les données
+    ./immich remove --data          supprime aussi photos, base et cache ML
+    ./immich remove --images        supprime aussi les images Docker
+    ./immich remove --all           données et images comprises
+
+  Données
+    ./immich backup [N]             sauvegarde la base dans ./backups (garde les N dernières)
+    ./immich restore [fichier]      restaure une sauvegarde (la plus récente par défaut)
+    ./immich disk                   taille des médias, de la base et des sauvegardes
+
+  Bibliothèques externes (dossiers existants, indexés sans être copiés)
+    ./immich library add <dossier>  monte le dossier dans le serveur, en lecture seule
+                                    (--rw pour autoriser Immich à supprimer des fichiers)
+    ./immich library remove <dossier>
+    ./immich library list           dossiers montés
+
+  Diagnostic et administration
+    ./immich status                 état des conteneurs, réponse de l'API, version
+    ./immich logs [service]         suit les journaux (ex. ./immich logs immich-server)
+    ./immich shell [service]        shell dans un conteneur (immich-server par défaut)
+    ./immich psql                   console SQL sur la base Immich
+    ./immich admin <commande>       immich-admin (list-users, reset-admin-password,
+                                    enable-maintenance-mode, grant-admin...)
+    ./immich reset-password         réinitialise le mot de passe administrateur
+    ./immich open                   ouvre l'interface dans le navigateur
+    ./immich help                   affiche cette aide
+
+Services : immich-server, immich-machine-learning, redis, database.
+HELP
+}
+
+# ------------------------------------------------------------------ dispatch
+
+case "${1:-help}" in
+    install)             shift; cmd_install "$@" ;;
+    start|up)            shift; cmd_start "$@" ;;
+    stop)                shift; cmd_stop "$@" ;;
+    restart)             shift; cmd_restart "$@" ;;
+    update|upgrade)      shift; cmd_update "$@" ;;
+    remove|down)         shift; cmd_remove "$@" ;;
+    status|ps)           shift; cmd_status "$@" ;;
+    logs)                shift; cmd_logs "$@" ;;
+    shell|bash)          shift; cmd_shell "$@" ;;
+    psql|db)             shift; cmd_psql "$@" ;;
+    admin)               shift; cmd_admin "$@" ;;
+    reset-password)      shift; cmd_admin reset-admin-password ;;
+    backup)              shift; cmd_backup "$@" ;;
+    restore)             shift; cmd_restore "$@" ;;
+    disk|du)             shift; cmd_disk "$@" ;;
+    library|lib)         shift; cmd_library "$@" ;;
+    open)                shift; cmd_open "$@" ;;
+    help|-h|--help)      cmd_help ;;
+    *) printf 'Commande inconnue : %s\n\n' "$1" >&2; cmd_help >&2; exit 1 ;;
+esac
